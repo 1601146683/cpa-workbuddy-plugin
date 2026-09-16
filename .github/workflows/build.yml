@@ -364,6 +364,26 @@ jobs:
           echo "ARCHIVE_NAME=${PLUGIN}_${CLEAN_VERSION}_${GOOS_PART%-*}_${GOOS_PART#*-}.zip" >> "${GITHUB_ENV}"
           echo "LIB_NAME=${PLUGIN}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
 
+      - name: Redirect retired FreeBSD 14.3 download to official archive
+        if: matrix.target == 'freebsd-amd64'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.ci-bin"
+          cat > "$GITHUB_WORKSPACE/.ci-bin/wget" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          args=()
+          for arg in "$@"; do
+            if [ "$arg" = "https://download.freebsd.org/releases/amd64/14.3-RELEASE/base.txz" ]; then
+              arg="https://archive.freebsd.org/old-releases/amd64/14.3-RELEASE/base.txz"
+            fi
+            args+=("$arg")
+          done
+          exec /usr/bin/wget "${args[@]}"
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/.ci-bin/wget"
+          echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
+
       - name: Build cross shared library
         timeout-minutes: 45
         uses: go-cross/cgo-actions@v1
