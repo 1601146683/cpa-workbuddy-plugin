@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -30,7 +31,11 @@ PLATFORMS = [
     "windows_arm64",
 ]
 
-RAW_BASE = "https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/release-assets"
+REPO = os.environ.get("CPA_PLUGIN_REPO", "1601146683/cpa-workbuddy-plugin")
+RAW_BASE = os.environ.get(
+    "CPA_PLUGIN_RAW_BASE",
+    f"https://raw.githubusercontent.com/{REPO}/main/release-assets",
+)
 
 
 def sha256_of(path: pathlib.Path) -> str:

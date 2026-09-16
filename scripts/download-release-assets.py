@@ -14,7 +14,7 @@ import re
 import sys
 import urllib.request
 
-REPO = "luode0320/cpa-workbuddy-plugin"
+REPO = os.environ.get("CPA_PLUGIN_REPO", "1601146683/cpa-workbuddy-plugin")
 PLUGIN = "workbuddy-provider"
 
 
