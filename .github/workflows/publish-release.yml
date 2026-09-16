@@ -49,10 +49,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -- "$dir"
           staged="$(git diff --cached --name-only)"
-          test "$(printf '%s
-' "$staged" | grep -c .)" -eq 8
-          if printf '%s
-' "$staged" | grep -v "^$dir/"; then
+          test "$(printf '%s\n' "$staged" | grep -c .)" -eq 8
+          if printf '%s\n' "$staged" | grep -v "^$dir/"; then
             echo "unexpected staged path"
             exit 1
           fi
