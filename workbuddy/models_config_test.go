@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -170,6 +171,22 @@ func TestConfiguredModels_StaticPrefersDynamicCache(t *testing.T) {
 	}
 	resp := decodeModelResponse(t, raw)
 	assertModelIDs(t, resp.Models, "upstream-new", "glm-5.2")
+}
+
+// 动态缓存过期且本次没有可用凭据时，继续返回最后成功列表，避免模型从宿主
+// 路由表中瞬时消失。
+func TestFetchDynamicModelsFromStorage_UsesLastSuccessfulCache(t *testing.T) {
+	resetDynamicModelsCache(t)
+	storeDynamicModels([]pluginapi.ModelInfo{{ID: "deepseek-v4.1-flash"}})
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.fetched = time.Now().Add(-dynamicModelsCacheTTL - time.Second)
+	dynamicModelsCache.Unlock()
+
+	if _, fresh := cachedDynamicModels(); fresh {
+		t.Fatalf("precondition: cache should be stale")
+	}
+	assertModelIDs(t, dynamicModelsFromCache(), "deepseek-v4.1-flash")
+	assertModelIDs(t, fetchDynamicModelsFromStorage(nil), "deepseek-v4.1-flash")
 }
 
 // 动态不可用时 model.for_auth 回退配置（配置保底）。
@@ -513,6 +530,24 @@ func TestParseModelsAPIResponse_RealUpstreamPayload(t *testing.T) {
 	// 3. disabled 条目（不在白名单内）与其它 agent 独有模型都不得出现。
 	if _, exists := byID["disabled-model"]; exists {
 		t.Fatalf("disabled model leaked into output")
+	}
+}
+
+// 上游会把 contextWindow 从数字灰度为对象；该兼容字段不可拖垮整份模型列表。
+// 数字字符串也按正整数读取，保留其它历史响应形态。
+func TestParseModelsAPIResponse_ToleratesStructuredModelLimits(t *testing.T) {
+	body := `{"code":0,"data":{"models":[` +
+		`{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash",` +
+		`"maxInputTokens":1000000,"maxOutputTokens":"128000",` +
+		`"contextWindow":{"unit":"token","size":1000000}}` +
+		`],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`
+	got, err := parseModelsAPIResponse([]byte(body))
+	if err != nil {
+		t.Fatalf("parseModelsAPIResponse: %v", err)
+	}
+	assertModelIDs(t, got, "deepseek-v4.1-flash")
+	if got[0].ContextLength != 1000000 || got[0].MaxCompletionTokens != 128000 {
+		t.Fatalf("limits = %d/%d, want 1000000/128000", got[0].ContextLength, got[0].MaxCompletionTokens)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -203,6 +204,16 @@ func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
 	return nil, false
 }
 
+// lastDynamicModels 返回最后一次成功发现的模型列表，不受缓存 TTL 限制。
+// [参数] 无
+// [返回] 模型列表副本；从未成功发现时返回 nil
+// 最近修改时间 2026-09-16（动态刷新失败时保留最后成功路由）
+func lastDynamicModels() []pluginapi.ModelInfo {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return nonEmptyModels(dynamicModelsCache.models)
+}
+
 func storeDynamicModels(models []pluginapi.ModelInfo) {
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.models = models
@@ -217,8 +228,8 @@ func storeDynamicModels(models []pluginapi.ModelInfo) {
 // wbModels()，调用方将无法区分"上游真的只有这些模型"与"上游调用失败"，
 // 导致新增模型被静默遮蔽且无任何可观测信号。
 // [参数] storageJSON：宿主传入的账号凭据 JSON
-// [返回] 动态模型列表；动态不可用时返回 nil
-// 最近修改时间 2026-09-12（取消静默回退 wbModels，改由 resolveModels 统一兜底）
+// [返回] 动态模型列表；刷新失败时优先返回最后成功列表，从未成功时返回 nil
+// 最近修改时间 2026-09-16（刷新失败时保留最后成功列表，避免模型路由瞬时消失）
 func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
 		return models
@@ -233,16 +244,18 @@ func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 		// 可观测性（2026-09-12）：StorageJSON 提取不到 token 是动态发现静默
 		// 失效的候选根因之一，必须留痕——否则生产只能看到兜底列表而无线索。
 		log.Printf("[workbuddy] models: dynamic discovery skipped, no access token in StorageJSON (len=%d)", len(storageJSON))
-		return nil
+		return lastDynamicModels()
 	}
 	dyn, err := callModelsAPI(accessToken)
 	if err != nil {
-		log.Printf("[workbuddy] models: dynamic discovery failed: %v", err)
-		return nil
+		stale := lastDynamicModels()
+		log.Printf("[workbuddy] models: dynamic discovery failed: %v; using last successful cache (%d models)", err, len(stale))
+		return stale
 	}
 	if len(dyn) == 0 {
-		log.Printf("[workbuddy] models: dynamic discovery returned 0 models")
-		return nil
+		stale := lastDynamicModels()
+		log.Printf("[workbuddy] models: dynamic discovery returned 0 models; using last successful cache (%d models)", len(stale))
+		return stale
 	}
 	log.Printf("[workbuddy] models: dynamic discovery ok: %d models", len(dyn))
 	storeDynamicModels(dyn)
@@ -394,33 +407,57 @@ func parseModelsAPIResponse(body []byte) ([]pluginapi.ModelInfo, error) {
 	return out, nil
 }
 
+// flexibleModelLimit 兼容模型限额字段的数字、数字字符串与未知结构。
+// 未知对象表示上游扩展元数据，不应导致整份模型列表解析失败；没有可识别数值时
+// 保持 0，由字段优先级链继续尝试其它候选。
+type flexibleModelLimit int64
+
+// UnmarshalJSON 读取数字或数字字符串；未知结构容错为 0。
+// [参数] data：单个模型限额字段的 JSON 原文
+// [返回] 始终返回 nil，避免非关键兼容字段阻断模型列表解析
+// 最近修改时间 2026-09-16（兼容 contextWindow 对象形态）
+func (v *flexibleModelLimit) UnmarshalJSON(data []byte) error {
+	var number int64
+	if err := json.Unmarshal(data, &number); err == nil {
+		*v = flexibleModelLimit(number)
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64); err == nil {
+			*v = flexibleModelLimit(parsed)
+		}
+	}
+	return nil
+}
+
 // upstreamModelEntry 是上游 models 数组的单个条目。
 //
 // 字段名以真实上游响应为准（2026-09-12 实测 copilot.tencent.com）：
 // 上下文上限是 maxInputTokens / maxAllowedSize，输出上限是 maxOutputTokens。
-// 旧实现读 contextWindow / maxTokens —— 这两个字段上游从不返回，导致
-// 所有动态模型的 ContextLength / MaxCompletionTokens 恒为 0。
+// 限额字段使用 flexibleModelLimit，避免 contextWindow 等兼容字段从数字演进为
+// 对象时让整份动态模型列表失效。
 type upstreamModelEntry struct {
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	Disabled           bool   `json:"disabled"`
-	MaxInputTokens     *int64 `json:"maxInputTokens"`
-	MaxOutputTokens    *int64 `json:"maxOutputTokens"`
-	MaxAllowedSize     *int64 `json:"maxAllowedSize"`
-	MaxContextLength   *int64 `json:"maxContextLength"`
-	ContextWindow      *int64 `json:"contextWindow"`
-	MaxTokens          *int64 `json:"maxTokens"`
-	MaxCompletionToken *int64 `json:"maxCompletionTokens"`
+	ID                 string             `json:"id"`
+	Name               string             `json:"name"`
+	Disabled           bool               `json:"disabled"`
+	MaxInputTokens     flexibleModelLimit `json:"maxInputTokens"`
+	MaxOutputTokens    flexibleModelLimit `json:"maxOutputTokens"`
+	MaxAllowedSize     flexibleModelLimit `json:"maxAllowedSize"`
+	MaxContextLength   flexibleModelLimit `json:"maxContextLength"`
+	ContextWindow      flexibleModelLimit `json:"contextWindow"`
+	MaxTokens          flexibleModelLimit `json:"maxTokens"`
+	MaxCompletionToken flexibleModelLimit `json:"maxCompletionTokens"`
 }
 
-// firstPositive 返回第一个非 nil 且为正数的值，全无时返回 0。
-// [参数] vals：候选值指针列表（按优先级排列）
+// firstPositive 返回第一个正数，全无时返回 0。
+// [参数] vals：候选值列表（按优先级排列）
 // [返回] 首个有效值；都不满足时 0
-// 最近修改时间 2026-09-12（随字段名对齐新增，兼容新旧字段形态）
-func firstPositive(vals ...*int64) int64 {
+// 最近修改时间 2026-09-16（适配 flexibleModelLimit 容错解析）
+func firstPositive(vals ...flexibleModelLimit) int64 {
 	for _, v := range vals {
-		if v != nil && *v > 0 {
-			return *v
+		if v > 0 {
+			return int64(v)
 		}
 	}
 	return 0
@@ -603,16 +640,16 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
 
-// dynamicModelsFromCache 只读返回未过期的动态模型缓存，不触发上游请求。
+// dynamicModelsFromCache 只读返回动态模型缓存，不触发上游请求。
 // 供 model.static 这类没有账号凭据的路径使用。
 // [参数] 无
-// [返回] 缓存中的模型列表；无有效缓存时返回 nil
-// 最近修改时间 2026-09-12（随 handleModelStatic 接入动态发现新增）
+// [返回] 优先返回未过期缓存，否则返回最后成功列表；从未成功时返回 nil
+// 最近修改时间 2026-09-16（过期时保留最后成功路由）
 func dynamicModelsFromCache() []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
 		return models
 	}
-	return nil
+	return lastDynamicModels()
 }
 
 // handleModelForAuth 返回指定账号的模型列表，优先级为动态 > 配置 > 静态默认。
