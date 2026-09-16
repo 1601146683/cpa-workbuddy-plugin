@@ -1,0 +1,74 @@
+name: Publish release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: Plugin id
+        required: true
+        type: choice
+        options: [workbuddy-provider, qoderwork-provider, workbuddy-token-usage, traework-provider]
+      version:
+        description: Version without v
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download and verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CPA_PLUGIN_REPO: ${{ github.repository }}
+          PLUGIN: ${{ inputs.plugin }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/download-release-assets.py "$VERSION" "$PLUGIN"
+          dir="release-assets/$PLUGIN-$VERSION"
+          test "$(find "$dir" -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 7
+          test -f "$dir/checksums.txt"
+
+      - name: Commit release assets
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          dir="release-assets/$PLUGIN-$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$dir"
+          staged="$(git diff --cached --name-only)"
+          test "$(printf '%s
+' "$staged" | grep -c .)" -eq 8
+          if printf '%s
+' "$staged" | grep -v "^$dir/"; then
+            echo "unexpected staged path"
+            exit 1
+          fi
+          git commit -m "chore(release): add $PLUGIN $VERSION release assets"
+          git push origin HEAD:main
+
+      - name: Publish registry entry
+        env:
+          CPA_PLUGIN_REPO: ${{ github.repository }}
+          PLUGIN: ${{ inputs.plugin }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/publish-assets.py "$PLUGIN" "$VERSION"
+          python3 scripts/validate-registry.py registry.json
+          git add -- registry.json
+          test "$(git diff --cached --name-only)" = "registry.json"
+          git commit -m "chore(registry): publish $PLUGIN $VERSION"
+          git push origin HEAD:main

@@ -591,7 +591,7 @@ jobs:
 
           ### Remote update (custom plugin source)
           \`\`\`
-          https://raw.githubusercontent.com/luode0320/cpa-workbuddy-plugin/main/registry.json
+          https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/registry.json
           \`\`\`
           EOF
           )
