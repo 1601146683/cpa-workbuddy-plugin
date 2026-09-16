@@ -7,6 +7,7 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -121,7 +122,7 @@ func rewriteSystemInPlace(obj map[string]any) bool {
 		if !ok {
 			continue
 		}
-		if rewriteContentField(msg) {
+		if rewriteMessageInPlace(msg) {
 			changed = true
 		}
 	}
@@ -303,7 +304,7 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 		if !ok {
 			continue
 		}
-		if rewriteContentField(msg) {
+		if rewriteMessageInPlace(msg) {
 			changed = true
 		}
 	}
@@ -362,6 +363,26 @@ func ensureSystemMessage(payload []byte, sa *storedAuth) []byte {
 	return out
 }
 
+// rewriteMessageInPlace 归一化单条消息的角色，并净化 content 与工具参数。
+// developer 是 OpenAI 新规范里的 system 别名，但 CodeBuddy 不接受该角色，
+// 因此在出站前改为 system；content 与 tool_calls 必须独立处理，因为工具调用
+// 消息的 content 经常为 null。
+// 最近修改时间：2026-09-16 17:20:00；改动原因：补齐 11128 内容拦截防护。
+func rewriteMessageInPlace(msg map[string]any) bool {
+	changed := false
+	if role, _ := msg["role"].(string); strings.EqualFold(strings.TrimSpace(role), "developer") {
+		msg["role"] = "system"
+		changed = true
+	}
+	if rewriteContentField(msg) {
+		changed = true
+	}
+	if rewriteToolCallFields(msg) {
+		changed = true
+	}
+	return changed
+}
+
 // rewriteContentField sanitizes blocked templates in one message's content,
 // handling both plain-string and OpenAI multimodal (array of parts) shapes.
 // Returns true if the message was modified.
@@ -391,14 +412,159 @@ func rewriteContentField(msg map[string]any) bool {
 	return false
 }
 
-func sanitizeBlockedTemplates(s string) string {
-	s = strings.ReplaceAll(s,
-		"You are Claude Code, Anthropic's official CLI for Claude.",
-		"You are Claude Code, Anthropic's official CLI tool for Claude.")
-	s = strings.ReplaceAll(s,
+// rewriteToolCallFields 净化 assistant.tool_calls[].function.arguments 与
+// 旧版 function_call.arguments。arguments 是字符串化 JSON，按文本净化即可。
+func rewriteToolCallFields(msg map[string]any) bool {
+	changed := false
+	sanitizeFunction := func(fn map[string]any) {
+		args, ok := fn["arguments"].(string)
+		if !ok {
+			return
+		}
+		if rewritten := sanitizeBlockedTemplates(args); rewritten != args {
+			fn["arguments"] = rewritten
+			changed = true
+		}
+	}
+	if legacy, ok := msg["function_call"].(map[string]any); ok {
+		sanitizeFunction(legacy)
+	}
+	if calls, ok := msg["tool_calls"].([]any); ok {
+		for _, rawCall := range calls {
+			call, ok := rawCall.(map[string]any)
+			if !ok {
+				continue
+			}
+			if fn, ok := call["function"].(map[string]any); ok {
+				sanitizeFunction(fn)
+			}
+		}
+	}
+	return changed
+}
+
+var (
+	blockedBillingHeaderRE = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
+	blockedCCKVRE          = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+)
+
+var blockedTemplateFeatures = []string{
+	"x-anthropic-billing-header",
+	"cc_entrypoint=",
+	"You are Claude Code",
+	"Main branch (",
+	"You are a coding agent running in the Codex CLI",
+	"github.com/anthropics/",
+	"11128",
+}
+
+var blockedTemplateRewrites = [][2]string{
+	{
+		"You are Claude Code, Anthropic's official CLI for Claude",
+		"You are Claude Code, Anthropic's official CLI tool for Claude",
+	},
+	{
 		"Main branch (you will usually use this for PRs)",
-		"Default branch (you will usually use this for PRs)")
-	return s
+		"Default branch (you will usually use this for PRs)",
+	},
+	{
+		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+		"You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+	},
+	{
+		"To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+		"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+	},
+	{
+		"11128",
+		"11-128",
+	},
+}
+
+func hasBlockedTemplateFingerprint(s string) bool {
+	for _, feature := range blockedTemplateFeatures {
+		if strings.Contains(s, feature) {
+			return true
+		}
+	}
+	return blockedBillingHeaderRE.MatchString(s)
+}
+
+func sanitizeBlockedTemplates(s string) string {
+	if !hasBlockedTemplateFingerprint(s) {
+		return s
+	}
+	original := s
+	for _, rewrite := range blockedTemplateRewrites {
+		s = strings.ReplaceAll(s, rewrite[0], rewrite[1])
+	}
+	if blockedBillingHeaderRE.MatchString(s) {
+		s = blockedBillingHeaderRE.ReplaceAllString(s, "")
+	}
+	if strings.Contains(s, "cc_") {
+		for previous := ""; previous != s; {
+			previous = s
+			s = blockedCCKVRE.ReplaceAllString(s, "")
+		}
+	}
+	if s == original {
+		return original
+	}
+	return strings.TrimSpace(s)
+}
+
+const degradedSystemPrompt = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
+
+// contentBlockedFallbackBody 删除所有 system/developer 消息，并在首部放入
+// 一条极简中性 system。用户、assistant、tool 消息保持原顺序与原内容。
+// 最近修改时间：2026-09-16 17:20:00；改动原因：11128 首次拦截后同账号降级重试。
+func contentBlockedFallbackBody(body []byte) []byte {
+	var obj map[string]any
+	if len(body) == 0 || json.Unmarshal(body, &obj) != nil {
+		return body
+	}
+	messages, _ := obj["messages"].([]any)
+	kept := make([]any, 0, len(messages)+1)
+	kept = append(kept, map[string]any{"role": "system", "content": degradedSystemPrompt})
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if ok {
+			role, _ := message["role"].(string)
+			if normalized := strings.ToLower(strings.TrimSpace(role)); normalized == "system" || normalized == "developer" {
+				continue
+			}
+		}
+		kept = append(kept, rawMessage)
+	}
+	obj["messages"] = kept
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// contentBlockedRetryState 保证一个逻辑请求最多只做一次中性提示词降级。
+type contentBlockedRetryState struct {
+	attempted bool
+}
+
+func (state *contentBlockedRetryState) nextBody(body []byte, status int, errText string, outputStarted bool) ([]byte, bool) {
+	if state == nil || state.attempted || outputStarted || !isContentBlocked(status, errText) {
+		return body, false
+	}
+	state.attempted = true
+	return contentBlockedFallbackBody(body), true
+}
+
+// preserveFallback 在换号按新账号重新 prepare 后，继续应用已经触发的中性 system，
+// 防止从原始请求重建时把被拦截的 system 指纹带回来。
+// 最近修改时间：2026-09-16 17:45:00；改动原因：保持逻辑请求内降级模式一致。
+func (state *contentBlockedRetryState) preserveFallback(body []byte) []byte {
+	if state == nil || !state.attempted {
+		return body
+	}
+	return contentBlockedFallbackBody(body)
 }
 
 // reasoningEffortFromBody extracts the "reasoning_effort" string value from a

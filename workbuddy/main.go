@@ -336,7 +336,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.14.33"
+var version = "0.14.34"
 
 func wbRegistration() registration {
 	return registration{
@@ -726,6 +726,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		completionErr error
 		usedAuthID    = req.AuthID
 	)
+	contentRetry := &contentBlockedRetryState{}
 
 	// 前置冷却拦截：如果初始账号正处于冷却中，不要发送无效的上游请求，立即换号！
 	initID := strings.TrimSpace(req.AuthID)
@@ -750,7 +751,20 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 
 	for attempt := 0; attempt <= budget; attempt++ {
-		completion, completionErr = doExecuteOnce(curBody, curSA, req.Model)
+		// 内容拦截先在同一账号内用中性 system 重试一次，不消耗换号预算。
+		for {
+			completion, completionErr = doExecuteOnce(curBody, curSA, req.Model)
+			if completionErr == nil {
+				break
+			}
+			statusCode := parseUpstreamStatusFromErr(completionErr)
+			nextBody, retry := contentRetry.nextBody(curBody, statusCode, completionErr.Error(), false)
+			if !retry {
+				break
+			}
+			curBody = nextBody
+			reasoningEffort = reasoningEffortFromBody(curBody)
+		}
 		if completionErr == nil {
 			authUID = curSA.Account.UID
 			accountLabel = strings.TrimSpace(curSA.Account.Nickname)
@@ -788,21 +802,24 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		// per-account tool/schema/system rules apply. body itself
 		// stays byte-identical w.r.t. the user's intent.
 		curBody = prepareUpstreamBody(req.Payload, req.OriginalRequest, curSA, upstreamModel)
+		curBody = contentRetry.preserveFallback(curBody)
 		reasoningEffort = reasoningEffortFromBody(curBody)
 	}
 	if completionErr != nil {
+		statusCode := parseUpstreamStatusFromErr(completionErr)
+		contentBlocked := isContentBlocked(statusCode, completionErr.Error())
 		// After exhausting retries (or a non-account-level error), mirror
 		// the historical accounting path: note the failure on the LAST
 		// account actually contacted and propagate the error.
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, parseUpstreamStatusFromErr(completionErr), completionErr.Error(), reasoningEffort, 0, accountLabel, sessionKey)
-		reconcileAfterExecutorError(usedAuthID, parseUpstreamStatusFromErr(completionErr), completionErr.Error())
-		statusCode := parseUpstreamStatusFromErr(completionErr)
-		if statusCode == 0 {
-			noteAccountFailure(usedAuthID, 0, completionErr.Error())
-		} else if statusCode == 200 {
-			// SSE error frame on HTTP 200: remap to 403 so isAccountFailure
-			// correctly triggers the 15s failover cooldown.
-			noteAccountFailure(usedAuthID, http.StatusForbidden, completionErr.Error())
+		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, completionErr.Error(), reasoningEffort, 0, accountLabel, sessionKey)
+		if !contentBlocked {
+			reconcileAfterExecutorError(usedAuthID, statusCode, completionErr.Error())
+			if statusCode == 0 {
+				noteAccountFailure(usedAuthID, 0, completionErr.Error())
+			} else if statusCode == 200 {
+				// 非内容拦截的 SSE 业务错误仍按账号故障进入冷却。
+				noteAccountFailure(usedAuthID, http.StatusForbidden, completionErr.Error())
+			}
 		}
 		return nil, completionErr
 	}
@@ -864,15 +881,17 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector)
 		if errCollect != nil {
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error(), reasoningEffort, collector.ttftNS(started), accountLabel, sessionKey)
-			// statusCode >= 400 already went through reconcileByUID inside
-			// collectUpstreamStream; only transport-level failures and HTTP-200
-			// SSE error frames need the failover note here. Override 200 to 403
-			// so isAccountFailure classifies it as an account-level failure and
-			// the account enters its 15s cooldown.
-			if statusCode == 0 {
-				noteAccountFailure(req.AuthID, 0, errCollect.Error())
-			} else if statusCode < 400 {
-				noteAccountFailure(req.AuthID, http.StatusForbidden, errCollect.Error())
+			if !isContentBlocked(statusCode, errCollect.Error()) {
+				// statusCode >= 400 already went through reconcileByUID inside
+				// collectUpstreamStream; only transport-level failures and HTTP-200
+				// SSE error frames need the failover note here. Override 200 to 403
+				// so isAccountFailure classifies it as an account-level failure and
+				// the account enters its 15s cooldown.
+				if statusCode == 0 {
+					noteAccountFailure(req.AuthID, 0, errCollect.Error())
+				} else if statusCode < 400 {
+					noteAccountFailure(req.AuthID, http.StatusForbidden, errCollect.Error())
+				}
 			}
 			return nil, errCollect
 		}

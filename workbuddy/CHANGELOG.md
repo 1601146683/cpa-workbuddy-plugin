@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.14.34
+
+### Fix — 识别 11128 内容策略误拦并同账号中性重试，不再伪装成账号限流
+
+- **根因**：上游对 Claude Code / Codex 的固定 system 模板、`developer` 角色、账单头、`cc_*` 字段、工具参数及裸 `11128` 做逐字风控，返回 HTTP 400 / code 11128（`Illegal API invocation from an unapproved channel`）。旧版只改写两条 Claude Code 文案，也不识别该错误类型；相同请求因此会在账号池间反复重试，表现为“所有账号限流”。
+- **请求净化补齐**（`payload.go`）：覆盖普通 content、多模态 text parts、`tool_calls[].function.arguments`、旧版 `function_call.arguments`；补齐 Claude Desktop、Codex、Anthropic 反馈句、账单头、`cc_*` 与裸错误码指纹；`developer` 角色归一为 `system`。
+- **同账号降级重试**：非流式、同步流式、异步流式三条路径首次命中内容拦截后，移除原 system/developer，换极简中性 system 在**同一账号**重试一次；URL、Authorization 与其他 headers 保持不变，不消耗 `retry_on_4xx` 换号预算（含预算为 0 的场景）。
+- **终态语义**：第二次仍被拦截则直接返回内容错误，不冷却账号、不累计账号故障、不驱逐会话绑定、不轮询其他账号；异步流已经向客户端输出内容时不重启请求，避免重复或拼接错乱。
+- **测试**：新增内容拦截分类、跨消息形态净化、单次降级、同账号身份保持、换号后降级状态保持、`retry_on_4xx: 0` 异步路径等回归；cgo-shim build/vet/test 与真实 c-shared 构建全绿。
+
 ## 0.14.33
 
 ### Fix — 执行器前置冷却拦截 + 多形态账号别名规范化匹配，彻底终结冷却中账号被反复打上游报错

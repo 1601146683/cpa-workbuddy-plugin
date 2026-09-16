@@ -93,6 +93,9 @@ func failoverCooldownFor(count int) time.Duration {
 // method not available for THIS account) all count. Business 4xx (400) is
 // excluded: it reflects the request, not the account.
 func isAccountFailure(status int, body string) bool {
+	if isContentBlocked(status, body) {
+		return false
+	}
 	if status == 0 || status >= 500 {
 		return true
 	}
@@ -109,6 +112,9 @@ func isAccountFailure(status int, body string) bool {
 // 路径，不在同请求内烧预算。
 // 最近修改时间：2026-09-06 17:00:00；改动原因：同步 traework 的 200 SSE 业务错误换号修复。
 func shouldRotateOnUpstreamErr(status int, errBody string) bool {
+	if isContentBlocked(status, errBody) {
+		return false
+	}
 	if status == http.StatusOK {
 		return isAccountFailure(status, errBody)
 	}
@@ -137,7 +143,7 @@ func shouldRotateOnUpstreamErr(status int, errBody string) bool {
 // ok=false signal once the pool is exhausted.
 func isAccountLevel4xx(status int) bool {
 	switch status {
-	case http.StatusUnauthorized,    // 401
+	case http.StatusUnauthorized, // 401
 		http.StatusForbidden,        // 403
 		http.StatusNotFound,         // 404
 		http.StatusMethodNotAllowed, // 405

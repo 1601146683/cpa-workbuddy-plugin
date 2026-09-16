@@ -148,6 +148,44 @@ func rebuildRequestWithSA(orig *http.Request, sa *storedAuth) (*http.Request, er
 	return req, nil
 }
 
+// retryContentBlockedRequest 用中性 system 重建同一账号的请求。URL、headers、
+// context 全部沿用原请求，只替换 body；因此不会切账号，也不会改变认证信息。
+// 最近修改时间：2026-09-16 17:20:00；改动原因：异步流 11128 同账号降级重试。
+func retryContentBlockedRequest(orig *http.Request, status int, errBody string, outputStarted bool, state *contentBlockedRetryState) (*http.Request, bool, error) {
+	if orig == nil {
+		return nil, false, fmt.Errorf("retryContentBlockedRequest: nil original request")
+	}
+	if state == nil || state.attempted || outputStarted || !isContentBlocked(status, errBody) {
+		return orig, false, nil
+	}
+	if orig.GetBody == nil {
+		return orig, false, fmt.Errorf("retryContentBlockedRequest: original request has no GetBody")
+	}
+	bodyRC, err := orig.GetBody()
+	if err != nil {
+		return orig, false, fmt.Errorf("retryContentBlockedRequest: get body: %w", err)
+	}
+	bodyBytes, readErr := io.ReadAll(bodyRC)
+	_ = bodyRC.Close()
+	if readErr != nil {
+		return orig, false, fmt.Errorf("retryContentBlockedRequest: read body: %w", readErr)
+	}
+	nextBody, retry := state.nextBody(bodyBytes, status, errBody, outputStarted)
+	if !retry {
+		return orig, false, nil
+	}
+	ctx := orig.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rebuilt, err := http.NewRequestWithContext(ctx, orig.Method, orig.URL.String(), bytes.NewReader(nextBody))
+	if err != nil {
+		return orig, false, fmt.Errorf("retryContentBlockedRequest: rebuild: %w", err)
+	}
+	rebuilt.Header = orig.Header.Clone()
+	return rebuilt, true, nil
+}
+
 // readAllUpstreamErr drains the response body of a failed 4xx/5xx upstream
 // call into a bounded byte slice so we can pass it to noteAccountFailure /
 // publishUsage without holding the body open indefinitely. Empty bodies

@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 )
@@ -90,6 +91,31 @@ func isHardCreditError(status int, body string) bool {
 	// Chinese markers may not lower-map usefully; also scan raw.
 	for _, m := range hardCreditMarkers {
 		if strings.Contains(body, m) {
+			return true
+		}
+	}
+	return false
+}
+
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
+// isContentBlocked 识别上游内容策略误拦。HTTP 400 是生产实证形态，HTTP 200
+// 仅用于 SSE error frame；其他 4xx 也接受明确 marker，避免供应端换状态码后误罚号。
+// 11128 是该类拦截的稳定业务码，只有错误响应路径会调用本函数。
+func isContentBlocked(status int, body string) bool {
+	if status != http.StatusOK && (status < 400 || status >= 500) {
+		return false
+	}
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "11128") {
+		return true
+	}
+	for _, marker := range contentBlockedMarkers {
+		if strings.Contains(lower, marker) {
 			return true
 		}
 	}

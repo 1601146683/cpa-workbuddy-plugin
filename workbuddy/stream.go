@@ -110,6 +110,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	curAuthID := authID
 	curAuthUID := authUID
 	curAccountLabel := accountLabel
+	contentRetry := &contentBlockedRetryState{}
 
 	// 前置冷却拦截：如果宿主分配的初始账号当前正在冷却中（如上一请求刚失败 403），
 	// 绝对不要对它发起自杀式的上游调用！在 attempt=0 之前立即换号到可用的健康候选。
@@ -127,7 +128,8 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		}
 	}
 
-	for attempt := 0; attempt <= budget; attempt++ {
+	// attempt 只统计真正的换号次数；内容拦截的同账号降级重试不消耗该预算。
+	for attempt := 0; attempt <= budget; {
 		stream, statusCode, _, err := hostHTTPDoStream(curReq)
 		if err != nil {
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, usage.Detail{}, true, 0, err.Error(), reasoningEffort, 0, curAccountLabel, sessionKey)
@@ -139,6 +141,19 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			// Drain the error body via the same bridge so the message is complete.
 			errPayload := readAllUpstreamErr(newHostStreamReader(stream))
 			stream.Close()
+			if isContentBlocked(statusCode, errPayload) {
+				nextReq, retry, retryErr := retryContentBlockedRequest(curReq, statusCode, errPayload, false, contentRetry)
+				if retry && retryErr == nil {
+					curReq = nextReq
+					continue
+				}
+				if retryErr != nil {
+					errPayload += " (degraded retry rebuild failed: " + retryErr.Error() + ")"
+				}
+				publishUsage(requestedModel, upstreamModel, curAuthUID, started, usage.Detail{}, true, statusCode, errPayload, reasoningEffort, 0, curAccountLabel, sessionKey)
+				streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errPayload, 200)))
+				return
+			}
 			publishUsage(requestedModel, upstreamModel, curAuthUID, started, usage.Detail{}, true, statusCode, errPayload, reasoningEffort, 0, curAccountLabel, sessionKey)
 			if curAuthUID != "" {
 				go reconcileByUID(curAuthUID, statusCode, errPayload)
@@ -183,6 +198,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			if curAccountLabel == "" {
 				curAccountLabel = curAuthUID
 			}
+			attempt++
 			continue
 		}
 		// Success — pump chunks to the host stream. From here on this
@@ -231,6 +247,20 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			return
 		}
 		if sseErr != "" {
+			if isContentBlocked(statusCode, sseErr) {
+				nextReq, retry, retryErr := retryContentBlockedRequest(curReq, statusCode, sseErr, emitted, contentRetry)
+				if retry && retryErr == nil {
+					curReq = nextReq
+					continue
+				}
+				if retryErr != nil {
+					sseErr += " (degraded retry rebuild failed: " + retryErr.Error() + ")"
+				}
+				// 内容拦截是请求级终态：记录请求失败，但不冷却、不驱逐绑定、不换号。
+				publishUsage(requestedModel, upstreamModel, curAuthUID, started, collector.detail(), true, statusCode, sseErr, reasoningEffort, collector.ttftNS(started), curAccountLabel, sessionKey)
+				streamEmitError(streamID, sseErr)
+				return
+			}
 			// SSE error frame on HTTP 200 must enter failover cooldown
 			// regardless of whether we rotate or surface the error. Remap
 			// to 403 so isAccountFailure classifies it as account-level
@@ -262,6 +292,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 			if curAccountLabel == "" {
 				curAccountLabel = curAuthUID
 			}
+			attempt++
 			continue
 		}
 		if !emitted {
@@ -305,6 +336,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 	var lastStatus int
 	var lastErr error
 
+	contentRetry := &contentBlockedRetryState{}
 	// 前置冷却拦截：如果初始账号处于冷却中，直接换号到健康候选
 	if curSA != nil {
 		currentID := strings.TrimSpace(curSA.Auth.AccessToken)
@@ -319,9 +351,21 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 	}
 
 	for attempt := 0; attempt <= budget; attempt++ {
-		chunks, statusCode, errOnce := collectUpstreamStreamOnce(body, curSA, sseFramed, collector)
-		if errOnce == nil {
-			return chunks, statusCode, nil
+		var (
+			chunks     []pluginapi.ExecutorStreamChunk
+			statusCode int
+			errOnce    error
+		)
+		for {
+			chunks, statusCode, errOnce = collectUpstreamStreamOnce(body, curSA, sseFramed, collector)
+			if errOnce == nil {
+				return chunks, statusCode, nil
+			}
+			nextBody, retry := contentRetry.nextBody(body, statusCode, errOnce.Error(), false)
+			if !retry {
+				break
+			}
+			body = nextBody
 		}
 		lastStatus = statusCode
 		lastErr = errOnce
@@ -375,10 +419,11 @@ func collectUpstreamStreamOnce(body []byte, sa *storedAuth, sseFramed bool, coll
 	reader := newHostStreamReader(stream)
 	if statusCode >= 400 {
 		errPayload, _ := io.ReadAll(reader)
-		if sa != nil && sa.Account.UID != "" {
-			go reconcileByUID(sa.Account.UID, statusCode, string(errPayload))
+		errText := string(errPayload)
+		if !isContentBlocked(statusCode, errText) && sa != nil && sa.Account.UID != "" {
+			go reconcileByUID(sa.Account.UID, statusCode, errText)
 		}
-		return nil, statusCode, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(string(errPayload), 200))
+		return nil, statusCode, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(errText, 200))
 	}
 	chunks, errAgg := aggregateSSEWithCollector(reader, statusCode, sseFramed, collector)
 	if errAgg != nil {
@@ -407,10 +452,11 @@ func doExecuteOnce(body []byte, sa *storedAuth, requestedModel string) ([]byte, 
 	reader := newHostStreamReader(stream)
 	if statusCode >= 400 {
 		payload, _ := io.ReadAll(reader)
-		if sa != nil && sa.Account.UID != "" {
-			go reconcileByUID(sa.Account.UID, statusCode, string(payload))
+		errText := string(payload)
+		if !isContentBlocked(statusCode, errText) && sa != nil && sa.Account.UID != "" {
+			go reconcileByUID(sa.Account.UID, statusCode, errText)
 		}
-		return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(string(payload), 200))
+		return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(errText, 200))
 	}
 	var firstByteAt time.Time
 	completion, err := aggregateCompletion(reader, requestedModel, statusCode, &firstByteAt)
