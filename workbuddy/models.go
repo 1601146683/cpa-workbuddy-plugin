@@ -436,7 +436,7 @@ type upstreamModelEntry struct {
 	MaxOutputTokens    flexibleModelLimit `json:"maxOutputTokens"`
 	MaxAllowedSize     flexibleModelLimit `json:"maxAllowedSize"`
 	MaxContextLength   flexibleModelLimit `json:"maxContextLength"`
-	ContextWindow      json.RawMessage `json:"contextWindow"`
+	ContextWindow      json.RawMessage    `json:"contextWindow"`
 	MaxTokens          flexibleModelLimit `json:"maxTokens"`
 	MaxCompletionToken flexibleModelLimit `json:"maxCompletionTokens"`
 }
