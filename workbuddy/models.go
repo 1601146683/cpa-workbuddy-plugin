@@ -19,19 +19,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// wbModels 原为硬编码静态模型列表。现已根据需求完全去除写死模型，
+// 模型完全依赖上游动态拉取（自动获取），返回 nil。
 func wbModels() []pluginapi.ModelInfo {
-	return []pluginapi.ModelInfo{
-		{ID: "glm-5.2", Name: "GLM-5.2", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "glm-5.1", Name: "GLM-5.1", ContextLength: 131072, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "glm-5v-turbo", Name: "GLM-5V Turbo", ContextLength: 131072, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "kimi-k2.7", Name: "Kimi K2.7", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "minimax-m3", Name: "MiniMax M3", ContextLength: 204800, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3", Name: "Hy3", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-preview", Name: "Hy3 Preview", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "hy3-preview-agent", Name: "Hy3 Preview Agent", ContextLength: 262144, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", ContextLength: 1000000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-	}
+	return nil
 }
 
 // configuredModels holds the config_yaml `models:` override. Empty means
@@ -445,7 +436,7 @@ type upstreamModelEntry struct {
 	MaxOutputTokens    flexibleModelLimit `json:"maxOutputTokens"`
 	MaxAllowedSize     flexibleModelLimit `json:"maxAllowedSize"`
 	MaxContextLength   flexibleModelLimit `json:"maxContextLength"`
-	ContextWindow      flexibleModelLimit `json:"contextWindow"`
+	ContextWindow      json.RawMessage `json:"contextWindow"`
 	MaxTokens          flexibleModelLimit `json:"maxTokens"`
 	MaxCompletionToken flexibleModelLimit `json:"maxCompletionTokens"`
 }
@@ -463,12 +454,40 @@ func firstPositive(vals ...flexibleModelLimit) int64 {
 	return 0
 }
 
+// contextWindowVal 尝试从 ContextWindow 解析出有效长度值。
+// 兼容整型（如 1000000）或复合对象（如 {"defaultLength": 300000, "supportedLengths": [300000, 1000000]}）。
+func (m upstreamModelEntry) contextWindowVal() flexibleModelLimit {
+	var n flexibleModelLimit
+	if err := json.Unmarshal(m.ContextWindow, &n); err == nil && n > 0 {
+		return n
+	}
+	var cw struct {
+		DefaultLength    flexibleModelLimit   `json:"defaultLength"`
+		SupportedLengths []flexibleModelLimit `json:"supportedLengths"`
+	}
+	if err := json.Unmarshal(m.ContextWindow, &cw); err == nil {
+		var maxLen flexibleModelLimit
+		for _, v := range cw.SupportedLengths {
+			if v > maxLen {
+				maxLen = v
+			}
+		}
+		if maxLen > 0 {
+			return maxLen
+		}
+		if cw.DefaultLength > 0 {
+			return cw.DefaultLength
+		}
+	}
+	return 0
+}
+
 // contextLength 取上下文上限，优先真实字段，兼容旧字段别名。
 // [参数] 无（接收者为上游条目）
 // [返回] 上下文长度；缺失时 0
-// 最近修改时间 2026-09-12（对齐上游 maxInputTokens）
+// 最近修改时间 2026-09-18（兼容上游 contextWindow 对象与数值双形态）
 func (m upstreamModelEntry) contextLength() int64 {
-	return firstPositive(m.MaxInputTokens, m.MaxAllowedSize, m.MaxContextLength, m.ContextWindow)
+	return firstPositive(m.MaxInputTokens, m.MaxAllowedSize, m.MaxContextLength, m.contextWindowVal())
 }
 
 // maxOutputTokens 取最大输出 token 数，优先真实字段，兼容旧字段别名。
@@ -621,21 +640,21 @@ func filterExcludedModels(models []pluginapi.ModelInfo, host pluginapi.HostConfi
 
 // handleModelStatic 返回宿主要求的全局模型列表。
 //
-// 优先级链与 handleModelForAuth 一致（动态 > 配置 > 静态默认）：静态路径过去
-// 只返回 wbModels() 而从不打上游，导致 CPA 配置刷新走静态路径时用户永远看不到
-// 上游新增模型；两条路径行为不对称是"自动拉取没生效"的根因之一。
-// StaticModelRequest 不带账号凭据，因此动态发现只能命中已有缓存（5 分钟 TTL），
-// 缓存未命中即正常回退到配置 / 静态默认。
+// 优先级链与 handleModelForAuth 一致（动态 > 配置 > 静态默认）：
+// 静态默认已去除硬编码写死模型，完全依赖动态获取；
+// StaticModelRequest 不带账号凭据，因此优先命中已有缓存（5 分钟 TTL）；
+// 缓存未命中时，尝试读取宿主已有有效凭据主动拉取一次上游模型并写入缓存；
+// 动态与配置均不可用时返回空列表。
 // [参数] raw：宿主传入的 StaticModelRequest
 // [返回] 成功 envelope；请求解析失败时返回错误
-// 最近修改时间 2026-09-12（接入动态发现缓存，与 for_auth 统一优先级链）
+// 最近修改时间 2026-09-18（去除写死模型，静态路径未命中缓存时尝试通过已有凭据主动拉取）
 func handleModelStatic(raw []byte) ([]byte, error) {
 	var req pluginapi.StaticModelRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 	cacheModelAliases(req.Host)
-	models := resolveModels(dynamicModelsFromCache(), getConfiguredModels(), wbModels())
+	models := resolveModels(dynamicModelsFromCacheOrAuth(), getConfiguredModels(), wbModels())
 	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
@@ -650,6 +669,58 @@ func dynamicModelsFromCache() []pluginapi.ModelInfo {
 		return models
 	}
 	return lastDynamicModels()
+}
+
+// dynamicModelsFromCacheOrAuth 优先使用未过期缓存；若缓存未命中，尝试从宿主已有的有效凭据拉取一次并写入缓存。
+func dynamicModelsFromCacheOrAuth() []pluginapi.ModelInfo {
+	if models, ok := cachedDynamicModels(); ok {
+		return models
+	}
+	if models := fetchDynamicModelsFromAnyAuth(); len(models) > 0 {
+		return models
+	}
+	// 刷新失败时保留最后成功路由，避免缓存过期后模型瞬时消失。
+	return lastDynamicModels()
+}
+
+// fetchDynamicModelsFromAnyAuth 在没有显式传入凭据的场景下（如 model.static），
+// 尝试通过宿主 auth 列表读取任意可用 workbuddy 账号的 AccessToken 拉取动态模型并写入缓存。
+func fetchDynamicModelsFromAnyAuth() []pluginapi.ModelInfo {
+	files, err := hostAuthList()
+	if err != nil || len(files) == 0 {
+		return nil
+	}
+	// 优先挑选未禁用的账号
+	for _, f := range files {
+		if f.Disabled {
+			continue
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil || sa == nil || sa.Auth.AccessToken == "" {
+			continue
+		}
+		dyn, err := callModelsAPI(sa.Auth.AccessToken)
+		if err == nil && len(dyn) > 0 {
+			storeDynamicModels(dyn)
+			return dyn
+		}
+	}
+	// 若未禁用的账号拉取失败，回退尝试其它账号
+	for _, f := range files {
+		if !f.Disabled {
+			continue
+		}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil || sa == nil || sa.Auth.AccessToken == "" {
+			continue
+		}
+		dyn, err := callModelsAPI(sa.Auth.AccessToken)
+		if err == nil && len(dyn) > 0 {
+			storeDynamicModels(dyn)
+			return dyn
+		}
+	}
+	return nil
 }
 
 // handleModelForAuth 返回指定账号的模型列表，优先级为动态 > 配置 > 静态默认。

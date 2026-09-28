@@ -1,6 +1,104 @@
 # Changelog
 
+## 0.14.42
+
+### 定制分支同步
+
+- 同步上游 0.14.42 的账号刷新、健康调度、测试标记和创建时间修复。
+- 保留 11128 同账号单次重试、数字字符串限额容错和最后成功模型路由。
+- 合并 contextWindow 对象解析，补充静态模型入口缓存过期回归测试。
+
+### Fix - 面板创建时间改为账号真实创建时间（JWT auth_time）
+
+- 根因：面板「创建」时间此前取宿主 HostAuthFileEntry.CreatedAt，该字段由宿主文件 watcher 每次扫描时用 time.Now() 重新赋值，因此会随积分刷新 / 保号 keepalive / 活跃测试写入漂移到「最近写入时刻」，并非账号创建时间。
+- 修复：新增 created_at.go 解析 accessToken JWT payload 的 auth_time（账号真实授权时间，登录时写定、token 刷新不变），面板优先采用；仅当 token 缺 auth_time 时回退宿主值。
+- 涉及文件：workbuddy/created_at.go、workbuddy/created_at_test.go、workbuddy/panel.go
+
+
+## 0.14.41
+
+### Fix - 面板创建时间独立成行显示北京时间 + 测试标签账号排除出可用过滤
+
+- 面板卡片创建时间从 uid 行拆出独立成行（此前被 nowrap+ellipsis 截断不可见）
+- 新增 fmtCST()：创建时间与积分快照时间统一转北京时间（Asia/Shanghai）展示
+- 「可用」过滤、计数、汇总全部排除 test_failed 账号（测试失败账号不再算可用）
+- 涉及文件：workbuddy/panel.html
+
+## 0.14.40
+
+### Feat - 路由优先使用「可用」账号 + 保号阈值降至 10
+
+- 变更要点:
+  1. scheduler.pick 新增健康层筛选：优先从缓存积分高于保号阈值的「可用」账号中选号，与面板「可用」过滤口径对齐。
+  2. 低积分/耗尽/无缓存账号降级为兜底层，仅当所有可用账号不可路由时才会被使用（避免好号被坏号占流量）。
+  3. 保号阈值默认值从 50 降为 10：低于 10 积分自动进入保号池。
+  4. 面板选中账号若低于阈值，同样会被降级切换到健康账号。
+- 涉及文件: workbuddy/scheduler.go、workbuddy/scheduler_test.go、workbuddy/watchdog.go、workbuddy/watchdog_test.go。
+
+## 0.14.39
+
+### Feat - 面板展示账号创建时间 + 默认按创建时间倒序
+
+- 变更要点:
+  1. `wbAccount` 新增 `created_at` 字段（host 凭据创建时间，RFC3339），卡片 UID 行尾追加「创建 <时间>」展示。
+  2. 面板排序默认改为「创建时间倒序」（新账号在前）；点击排序按钮依次切换：创建倒序 → 积分升序 → 积分降序 → 创建倒序。
+  3. 无创建时间的账号排在最后。
+- 涉及文件: workbuddy/panel.go、workbuddy/panel.html。
+
+## 0.14.38
+
+### Fix - 移除管理层令牌桶限流 + 刷新改并发 10
+
+- 变更要点:
+  1. 彻底移除管理层 per-IP 令牌桶限流（v0.6.31 引入），面板并发刷新/签到/测试不会再被限流误杀。
+  2. 账号刷新队列从串行（1 账号/秒）改为并发 10（`refreshConcurrency = 10`），大幅缩短全量刷新耗时。
+  3. 通过 `inFlight` 标志保留幂等性：已有刷新轮在跑时，新的 EnqueueAll / EnqueueOne 调用被忽略。
+- 涉及文件: workbuddy/management.go、workbuddy/refresh_runner.go、workbuddy/refresh_runner_test.go。
+
+## 0.14.37
+
+### Fix - 面板并发操作触发管理层限流
+
+- 变更要点:
+  1. 将管理层令牌桶限流从「所有 POST 均消耗 token」修正为「仅鉴权失败时消耗 token」，与 traework / qoderwork 行为对齐。
+  2. 修复面板加载时并发刷新、签到、测试等操作在容量 5 / 6 秒回填 1 的限流下被误杀（rate limit exceeded）的问题。
+- 涉及文件: workbuddy/management.go。
+
+## 0.14.36
+
+### Feat - 定时活跃测试失败自动标记「测试」标签 + 面板支持按测试标签过滤
+
+- 变更要点:
+  1. 定时活跃测试失败且账号仍有积分时，自动向物理 auth JSON 直写顶层 `test_failed: true` 标签，便于人工识别和清理后续无法使用的账号；积分未知或已耗尽的账号不打标签。
+  2. 定时活跃测试成功后自动清除既有 `test_failed` 标签；字段不存在时不产生额外写盘。
+  3. 面板手动「测试」按钮失败不会打标签，保持手动测试与定时自动标记职责分离。
+  4. 账号列表新增 `test_failed` 字段，面板过滤条新增「测试」标签按钮、计数、卡片 badge、显隐过滤与用量汇总标题联动。
+- 涉及文件: workbuddy/test_failed_tag.go、workbuddy/test_failed_tag_test.go、workbuddy/active_ping.go、workbuddy/panel.go、workbuddy/panel.html。
+
 ## 0.14.35
+
+### Feat - 账号刷新自动发起轻量活跃探测(hi) + 面板新增手动测试按钮
+
+- 变更要点:
+  1. 刷新自动活跃探测: 在账号积分刷新(Watchdog 周期巡检、单卡刷新按钮、面板全量刷新)后，若该账号距上次活跃超过 30 分钟，自动挑选该账号可用的动态模型随机发起一次轻量推理探测(user: "hi", max_tokens: 5)，保持账号活跃度。
+  2. 故障与生命周期隔离: 自动活跃探测采用异步安全模式，失败仅记录 warning 日志，绝不阻断正常刷新链路，亦不污染账号的连续失败计数与故障降级状态。
+  3. 面板新增手动「测试」按钮: 在面板每张卡片底部的操作栏(刷新与签到按钮右侧)新增「测试」按钮，点击通过 POST /test-active 立即发起一次真实推理探测(绕过 30 分钟防抖限制)，成功后即时展示探测模型与响应耗时并更新最后活跃时间，失败友好反馈错误原因。
+- 涉及文件: workbuddy/active_ping.go、workbuddy/active_ping_test.go、workbuddy/refresh_runner.go、workbuddy/management.go、workbuddy/panel.html。
+
+## 0.14.34
+
+### Fix — 去除写死模型列表完全依靠自动拉取 + 兼容上游 contextWindow 对象结构根治动态拉取失败
+
+- **根因**：
+  1. 上游 `/console/enterprises/personal/models` 近期将 `contextWindow` 字段变更为对象形态 `{"defaultLength": 300000, "supportedLengths": [300000, 1000000]}`，而插件的 `upstreamModelEntry` 历史将其声明为 `ContextWindow *int64`，导致 Go 的 JSON 反序列化报 `json: cannot unmarshal object into Go struct field upstreamModelEntry.data.models.contextWindow of type int64`，动态发现调用全线报错失败。
+  2. 动态拉取失败后系统回退到 `wbModels()`，展示出写死的 10 个老模型列表（包含已下线的幽灵模型，缺少 `deepseek-v4.1-flash`、`kimi-k2.8-preview` 等全部新模型）。
+- **修复**：
+  - **兼容上游 `contextWindow` 双形态**：`ContextWindow` 字段类型调整为 `json.RawMessage`，新增 `contextWindowVal()` 辅助解析，既兼容对象形态（优先取 `supportedLengths` 最大值或 `defaultLength`）又兼容传统数值形态，彻底杜绝类型不匹配导致的 unmarshal 崩溃。
+  - **去除硬编码写死模型**：清空 `wbModels()` 硬编码模型列表，函数返回 `nil`，模型完全依靠自动获取；无配置且动态不可用时返回空列表。
+  - **静态路径主动探测补位**：`handleModelStatic` 接入 `dynamicModelsFromCacheOrAuth()`，当全局动态缓存未命中时，主动读取宿主已有有效凭据向外部拉取一次并填补缓存，保证 `model.static` 与 `model.for_auth` 均可完整呈现上游实时全量模型。
+- **测试**：更新 `upstreamModelsFixture` 并新增 `TestParseModelsAPIResponse_ContextWindowObject`、`TestParseModelsAPIResponse_ContextWindowInt`，修改静态兜底断言用例。`python scripts/cgo-shim-build.py workbuddy` 全部通过。
+
+## 0.14.35（定制分支）
 
 ### Fix - 兼容模型限额对象并保留最后成功的动态模型路由
 
@@ -9,7 +107,7 @@
 - **路由稳定性**（`models.go`）：动态刷新失败、无凭据或返回空列表时复用最后一次成功模型列表；`model.static` 在 TTL 过期后也继续提供最后成功路由。
 - **测试**（`models_config_test.go`）：覆盖结构化 `contextWindow`、数字字符串限额以及过期缓存的最后成功回退；完整 cgo-shim build/vet/test 全绿。
 
-## 0.14.34
+## 0.14.34（定制分支）
 
 ### Fix — 识别 11128 内容策略误拦并同账号中性重试，不再伪装成账号限流
 
@@ -18,6 +116,7 @@
 - **同账号降级重试**：非流式、同步流式、异步流式三条路径首次命中内容拦截后，移除原 system/developer，换极简中性 system 在**同一账号**重试一次；URL、Authorization 与其他 headers 保持不变，不消耗 `retry_on_4xx` 换号预算（含预算为 0 的场景）。
 - **终态语义**：第二次仍被拦截则直接返回内容错误，不冷却账号、不累计账号故障、不驱逐会话绑定、不轮询其他账号；异步流已经向客户端输出内容时不重启请求，避免重复或拼接错乱。
 - **测试**：新增内容拦截分类、跨消息形态净化、单次降级、同账号身份保持、换号后降级状态保持、`retry_on_4xx: 0` 异步路径等回归；cgo-shim build/vet/test 与真实 c-shared 构建全绿。
+
 
 ## 0.14.33
 

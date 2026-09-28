@@ -156,6 +156,7 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/delete", Description: "Delete one WorkBuddy account and its physical auth file (body: {auth_index})."},
 			{Method: http.MethodPost, Path: base + "/keepalive", Description: "Manually refresh access tokens for all accounts (or one with auth_index)."},
 			{Method: http.MethodGet, Path: base + "/keepalive/status", Description: "Last keepalive run summary + config."},
+			{Method: http.MethodPost, Path: base + "/test-active", Description: "Send an active ping chat inference request for one account (body: {auth_index})."},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "WorkBuddy", Description: "WorkBuddy dashboard: credits, check-in, plan, import."},
@@ -177,16 +178,9 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtHTMLResponse(servePanel(sub)))
 	}
 
-	// Plugin-layer auth + rate limit for mutating endpoints (v0.6.31).
-	// Only enforced when management_key is configured; otherwise host middleware
-	// is the sole guard (historical default).
+	// Plugin-layer auth for mutating endpoints (defence-in-depth on top of
+	// the host middleware; skipped when no management_key is configured).
 	if req.Method == http.MethodPost || mutatingManagementPath(path) {
-		ip := managementClientIP(req)
-		if !allowManagementRequest(ip) {
-			return okEnvelope(mgmtJSONResponse(http.StatusTooManyRequests, map[string]any{
-				"error": "rate limit exceeded, try again later",
-			}))
-		}
 		if status, msg := checkManagementAuth(req); status != 0 {
 			return okEnvelope(mgmtJSONResponse(status, map[string]any{"error": msg}))
 		}
@@ -217,6 +211,8 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleSelectAuth(req)))
 	case req.Method == http.MethodPost && path == base+"/delete":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleDeleteAuth(req)))
+	case req.Method == http.MethodPost && path == base+"/test-active":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleTestActive(req)))
 	case req.Method == http.MethodPost && path == base+"/keepalive":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleKeepaliveNow(req)))
 	case req.Method == http.MethodGet && path == base+"/keepalive/status":
@@ -243,7 +239,7 @@ func handleRefreshAsync() map[string]any {
 }
 
 // -----------------------------------------------------------------------------
-// Plugin-layer management auth + rate limit (v0.6.31)
+// Plugin-layer management auth
 // -----------------------------------------------------------------------------
 //
 // When management_key is configured (config_yaml or WB_MANAGEMENT_KEY env), all
@@ -252,25 +248,6 @@ func handleRefreshAsync() map[string]any {
 // the panel can render before the user has pasted a key — the panel itself
 // supplies the key on every call via Authorization header.
 //
-// A per-IP token-bucket rate limiter guards against brute-force when the key
-// check fails repeatedly.
-
-const (
-	mgmtRateLimitCapacity = 5                // burst
-	mgmtRateLimitRefill   = time.Minute / 10 // 1 token per 6s
-	mgmtRateLimitTTL      = 10 * time.Minute // idle entry eviction
-)
-
-type mgmtRateEntry struct {
-	tokens   float64
-	lastSeen time.Time
-}
-
-var (
-	mgmtRateLimit   = map[string]*mgmtRateEntry{}
-	mgmtRateLimitMu sync.Mutex
-)
-
 func loadedManagementKey() string {
 	managementAPIKeyMu.RLock()
 	defer managementAPIKeyMu.RUnlock()
@@ -293,59 +270,6 @@ func checkManagementAuth(req pluginapi.ManagementRequest) (int, string) {
 		return http.StatusForbidden, "invalid management key"
 	}
 	return 0, ""
-}
-
-// allowManagementRequest applies a per-IP token bucket. ip may be empty when the
-// host doesn't forward X-Forwarded-For / RemoteAddr — in that case use a single
-// global bucket.
-func allowManagementRequest(ip string) bool {
-	if ip == "" {
-		ip = "_global"
-	}
-	mgmtRateLimitMu.Lock()
-	defer mgmtRateLimitMu.Unlock()
-	now := time.Now()
-	e, ok := mgmtRateLimit[ip]
-	if !ok {
-		e = &mgmtRateEntry{tokens: mgmtRateLimitCapacity, lastSeen: now}
-		mgmtRateLimit[ip] = e
-	}
-	// Refill.
-	elapsed := now.Sub(e.lastSeen)
-	e.tokens += float64(elapsed) / float64(mgmtRateLimitRefill)
-	if e.tokens > mgmtRateLimitCapacity {
-		e.tokens = mgmtRateLimitCapacity
-	}
-	e.lastSeen = now
-	if e.tokens < 1 {
-		return false
-	}
-	e.tokens--
-	// Lazy eviction of idle entries (don't grow the map forever).
-	if len(mgmtRateLimit) > 1024 {
-		for k, v := range mgmtRateLimit {
-			if now.Sub(v.lastSeen) > mgmtRateLimitTTL {
-				delete(mgmtRateLimit, k)
-			}
-		}
-	}
-	return true
-}
-
-// managementClientIP extracts a best-effort client identifier for rate limiting.
-// CPA host doesn't currently forward RemoteAddr, so fall back to X-Forwarded-For
-// / X-Real-IP headers if the deployment adds them via a reverse proxy.
-func managementClientIP(req pluginapi.ManagementRequest) string {
-	if xff := strings.TrimSpace(req.Headers.Get("X-Forwarded-For")); xff != "" {
-		if i := strings.Index(xff, ","); i > 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return xff
-	}
-	if xr := strings.TrimSpace(req.Headers.Get("X-Real-Ip")); xr != "" {
-		return xr
-	}
-	return ""
 }
 
 // mutatingManagementPath reports whether the path performs a write (checkin,

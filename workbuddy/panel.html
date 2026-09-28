@@ -68,6 +68,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .badge.cn{background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border)}
 .badge.global{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn-border)}
 .badge.preserve{background:var(--mut-soft);color:var(--mut);border:1px solid var(--mut-border);font-style:italic}
+.badge.test-failed{background:var(--mut-soft);color:var(--mut);border:1px solid var(--mut-border);font-style:italic}
 .badge.stat{background:var(--mut-soft);color:var(--mut);border:1px solid var(--mut-border);font-weight:500}
 .badge.cooling{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn-border)}
 /* 后台刷新卡片三态（data-refresh-state：pending/running/done/failed）
@@ -234,7 +235,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     <button class="sec" onclick="claimTrialAll(this)" title="仅 Global · 一次性">全部领取</button>
     <button class="sec" id="unfreezeAllBtn" onclick="unfreezeAll(this)" title="将异常池中所有账号解除冻结（每日 0 点也会自动做）">全部解冻</button>
     <input id="searchInput" class="search" type="search" placeholder="搜索 nickname / UID" oninput="onSearchChange(this.value)" autocomplete="off">
-    <button class="sec sort-btn" id="sortBtn" onclick="toggleSort(this)" title="按可用积分切换升序/降序">积分 ↕</button>
+<button class="sec sort-btn" id="sortBtn" onclick="toggleSort(this)" title="当前：创建时间倒序（新→旧），点击切积分升序">创建 ↓</button>
     <label class="toggle" title="仅 CN 账号 09:00 / 21:00"><input type="checkbox" id="autoToggle" onchange="toggleAuto(this.checked)"> 自动签到(CN)</label>
     <span class="toggle" id="svtime"></span>
     <span class="toggle ref-progress" id="refreshProgress" style="display:none"></span>
@@ -247,6 +248,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
     <button type="button" class="ftag" data-region="exhausted" onclick="filterRegion('exhausted',this)">耗尽 <span class="cnt" id="cntExhausted">0</span></button>
     <button type="button" class="ftag" data-region="preserve" onclick="filterRegion('preserve',this)">保号 <span class="cnt" id="cntPreserve">0</span></button>
     <button type="button" class="ftag" data-region="failed" onclick="filterRegion('failed',this)" title="累计失败 > 0 或连败中（fail_count > 0）的账号；卡片上的「失败/连败/冷却」段即数据来源">失败 <span class="cnt" id="cntFailed">0</span></button>
+    <button type="button" class="ftag" data-region="test" onclick="filterRegion('test',this)" title="定时活跃测试失败且仍有积分的账号；建议人工复核后清理">测试 <span class="cnt" id="cntTest">0</span></button>
   </div>
   <div class="summary card" id="summaryBox" style="display:none"></div>
   <div id="grid" class="grid"><div class="loading">加载中…</div></div>
@@ -419,7 +421,7 @@ function progressHTML(c, a){
   const total=size>0?size:(remain+used);
   const pct=total>0?Math.round(used/total*100):0;
   let color='var(--ok)'; if(pct>60)color='var(--warn)'; if(pct>85)color='var(--err)';
-  const when=c.fetched_at?` · 快照 ${esc(String(c.fetched_at).replace('T',' ').replace('Z',' UTC'))}`:'';
+  const when=c.fetched_at?` · 快照 ${esc(fmtCST(c.fetched_at))}`:'';
   return `<div class="pb"><div class="pb-label"><span class="pb-primary"><span class="pb-segment">可用 ${remain}</span>${statHTML}</span><span class="pb-used">已用 ${used} · ${pct}%</span></div><div class="pb-track"><div class="pb-bar" style="width:${pct}%;background:${color}"></div></div><div class="pb-meta">剩余 ${remain} · 已用 ${used} · 额度池 ${total}${c.pack_count?` · ${c.pack_count} 个包`:''}${when}</div></div>`;
 }
 function bindCardActions(root){
@@ -433,10 +435,18 @@ function bindCardActions(root){
       else if(act==="claim") claimTrial(idx, ev.currentTarget);
       else if(act==="select") selectAuth(idx, ev.currentTarget);
       else if(act==="refresh") refreshCredits(idx, ev.currentTarget);
+      else if(act==="test") testActive(idx, ev.currentTarget);
       else if(act==="unfreeze") unfreezeOne(idx, ev.currentTarget);
       else if(act==="delete") openDeleteModal(idx);
     });
   });
+}
+// 统一北京时间展示：RFC3339/ISO 输入 → "YYYY-MM-DD HH:mm:ss"（Asia/Shanghai）。
+function fmtCST(s){
+  if(!s) return "";
+  const d=new Date(s);
+  if(isNaN(d.getTime())) return String(s);
+  return d.toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}).replaceAll("/","-");
 }
 function card(a){
   const plan=(a.plan||"unknown").toLowerCase();
@@ -463,13 +473,15 @@ function card(a){
   }
   const refreshBtn=`<button class="sec" data-action="refresh" data-auth-index="${esc(a.auth_index)}" title="刷新积分">刷新</button>`;
   const preserveBadge=a.preserve?`<span class="badge preserve" title="watchdog 检测到积分不足，账号暂停路由以保留积分别耗尽">保号</span>`:"";
-  const badges=preserveBadge+(exhausted?`<span class="badge exhausted">耗尽</span>`:"")+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
-  return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-nickname="${esc(a.nickname||a.label||a.name||"")}" data-label="${esc(a.label||"")}" data-name="${esc(a.name||"")}" data-uid="${esc(a.uid||"")}" data-preserve="${a.preserve?"1":"0"}" data-failed="${((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0)?"1":"0"}">
+  const testFailedBadge=a.test_failed?`<span class="badge test-failed" title="定时活跃测试失败且仍有积分；建议人工复核后清理">测试</span>`:"";
+  const badges=preserveBadge+testFailedBadge+(exhausted?`<span class="badge exhausted">耗尽</span>`:"")+regionBadge+`<span class="badge ${plan}">${esc(a.plan||"-")}</span>`;
+  return `<div class="card${selected?" selected":""}" data-region="${region}" data-auth="${esc(a.auth_index)}" data-nickname="${esc(a.nickname||a.label||a.name||"")}" data-label="${esc(a.label||"")}" data-name="${esc(a.name||"")}" data-uid="${esc(a.uid||"")}" data-preserve="${a.preserve?"1":"0"}" data-test="${a.test_failed?"1":"0"}" data-failed="${((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0)?"1":"0"}">
   <h2>${esc(a.nickname||a.label||a.name)} <span style="display:flex;gap:6px;align-items:center">${badges}<button type="button" class="card-del" data-action="delete" data-auth-index="${esc(a.auth_index)}" title="删除账号（需二次确认）" aria-label="删除账号">×</button></span></h2>
   <div class="uid">${esc(a.uid||"")} · ${esc(a.name||"")}</div>
+  ${a.created_at?`<div class="uid">创建 ${esc(fmtCST(a.created_at))}</div>`:''}
   ${progressHTML(cr,a)}
   ${a.error?`<div class="row"><span class="k">错误</span><span class="v err">${esc(a.error)}</span></div>`:""}
-  <div class="actions">${refreshBtn}${actionHTML}</div>
+  <div class="actions">${refreshBtn}${actionHTML}<button class="sec" data-action="test" data-auth-index="${esc(a.auth_index)}" title="测试账号活跃并发送一次推理请求">测试</button></div>
   </div>`;
 }
 // 冷却倒计时：每秒刷新积分首行中的冷却剩余秒数。
@@ -493,13 +505,14 @@ let authFailUntil=0;
    credits.total_remain (unknown credits count as -1, i.e. "least").
 */
 let currentSearch="";   // trimmed, lowercase
-let currentSort="none"; // "none" | "asc" | "desc"
-const SORT_LABELS={none:"积分 ↕", asc:"积分 ↑", desc:"积分 ↓"};
-const SORT_NEXT={none:"asc", asc:"desc", desc:"none"};
+let currentSort="created_desc"; // "created_desc" | "asc" | "desc" | "none"
+const SORT_LABELS={created_desc:"创建 ↓", asc:"积分 ↑", desc:"积分 ↓", none:"创建 ↓"};
+const SORT_NEXT={created_desc:"asc", asc:"desc", desc:"none", none:"created_desc"};
 const SORT_TITLE={
-  none:"按可用积分排序（点击切升序：剩余少→多）",
+  created_desc:"当前：创建时间倒序（新→旧），点击切积分升序",
   asc:"当前：积分升序（剩余少→多），点击切降序",
-  desc:"当前：积分降序（剩余多→少），点击关闭排序"
+  desc:"当前：积分降序（剩余多→少），点击切创建时间倒序",
+  none:"按创建时间倒序（新→旧），点击切积分升序"
 };
 function onSearchChange(q){
   currentSearch=(q==null?"":String(q)).trim().toLowerCase();
@@ -511,15 +524,22 @@ function toggleSort(btn){
   if(btn){
     btn.textContent=SORT_LABELS[currentSort];
     btn.title=SORT_TITLE[currentSort];
-    btn.classList.toggle("active", currentSort!=="none");
+  btn.classList.toggle("active", currentSort!=="created_desc");
   }
   renderGrid();
 }
-// Sort by available credits (total_remain). Unknown credits → -1 so they land
-// at the "least" end (top in asc, bottom in desc).
+// Default sort: creation time descending (newest first). Toggling switches to
+// credits-based sorting; unknown credits count as -1 so they land at the
+// "least" end.
 function sortedAccounts(accounts){
   const list=accounts||[];
-  if(currentSort==="none") return list;
+  if(currentSort==="none"||currentSort==="created_desc"){
+    return [...list].sort((x,y)=>{
+      const xt=x&&x.created_at?Date.parse(x.created_at):0;
+      const yt=y&&y.created_at?Date.parse(y.created_at):0;
+      return yt-xt;
+    });
+  }
   const dir=currentSort==="asc"?1:-1;
   return [...list].sort((x,y)=>{
     const xr=x&&x.credits?Number(x.credits.total_remain||0):-1;
@@ -545,12 +565,13 @@ function applyCardVisibility(){
     let show=true;
     if(currentFilter==="all") show=true;
     else if(currentFilter==="available"){
-      // 可用 = 不是保号池 / 已耗尽（积分耗尽）
-      const unavailable=c.dataset.preserve==="1"||c.querySelector(".badge.exhausted")!=null;
+      // 可用 = 不是保号池 / 已耗尽（积分耗尽）/ 测试失败
+      const unavailable=c.dataset.preserve==="1"||c.dataset.test==="1"||c.querySelector(".badge.exhausted")!=null;
       show=!unavailable;
     }
     else if(currentFilter==="exhausted") show=c.querySelector(".badge.exhausted")!=null;
     else if(currentFilter==="preserve") show=c.dataset.preserve==="1";
+    else if(currentFilter==="test") show=c.dataset.test==="1";
     else if(currentFilter==="failed") show=c.dataset.failed==="1";
     else show=r===currentFilter;
     if(show&&q){
@@ -706,15 +727,16 @@ function filterRegion(region, btn){
   renderSummary(lastAccounts);
 }
 function updateFilterCounts(accounts){
-  let cn=0, gl=0, ex=0, prs=0, ava=0, fail=0;
+  let cn=0, gl=0, ex=0, prs=0, ava=0, fail=0, test=0;
   (accounts||[]).forEach(a=>{
     if((a.region||"cn")==="global") gl++; else cn++;
     if(a.exhausted||(a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length)))) ex++;
     if(a.preserve) prs++;
+    if(a.test_failed) test++;
     // 失败 = 累计失败 > 0 或连败中（fail_count > 0）
     if((Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0) fail++;
-    // 可用 = 不属于保号池 / 耗尽
-    const isUnavailable=!!a.preserve||!!a.exhausted||(!!a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length)));
+    // 可用 = 不属于保号池 / 耗尽 / 测试失败
+    const isUnavailable=!!a.preserve||!!a.test_failed||!!a.exhausted||(!!a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length)));
     if(!isUnavailable) ava++;
   });
   const elAll=document.getElementById("cntAll");
@@ -724,6 +746,7 @@ function updateFilterCounts(accounts){
   const elEx=document.getElementById("cntExhausted");
   const elPrs=document.getElementById("cntPreserve");
   const elFail=document.getElementById("cntFailed");
+  const elTest=document.getElementById("cntTest");
   if(elAll) elAll.textContent=String((accounts||[]).length);
   if(elAv) elAv.textContent=String(ava);
   if(elCn) elCn.textContent=String(cn);
@@ -731,18 +754,22 @@ function updateFilterCounts(accounts){
   if(elEx) elEx.textContent=String(ex);
   if(elPrs) elPrs.textContent=String(prs);
   if(elFail) elFail.textContent=String(fail);
+  if(elTest) elTest.textContent=String(test);
 }
 function accountsForFilter(accounts){
   const list=accounts||[];
   if(currentFilter==="all") return list;
   if(currentFilter==="available"){
-    return list.filter(a=>!a.preserve&&!a.exhausted&&!(a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length))));
+    return list.filter(a=>!a.preserve&&!a.test_failed&&!a.exhausted&&!(a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length))));
   }
   if(currentFilter==="exhausted"){
     return list.filter(a=>a.exhausted||(a.credits&&a.credits.total_remain===0&&(a.credits.total_used>0||(a.credits.packages&&a.credits.packages.length))));
   }
   if(currentFilter==="preserve"){
     return list.filter(a=>!!a.preserve);
+  }
+  if(currentFilter==="test"){
+    return list.filter(a=>!!a.test_failed);
   }
   if(currentFilter==="failed"){
     return list.filter(a=>(Number(a.failed)||0)>0||(Number(a.fail_count)||0)>0);
@@ -778,7 +805,7 @@ function renderSummary(accounts){
     const c=creditOf(a);
     // 不可用 = 保号池 / 耗尽（积分耗尽的等价判定）
     const isExhausted=!!a.exhausted||(c.known&&c.remain===0&&(c.used>0||c.size>0));
-    const isUnavailable=!!a.preserve||isExhausted;
+    const isUnavailable=!!a.preserve||!!a.test_failed||isExhausted;
     if(c.known){
       if(isUnavailable){ remainUnavail+=c.remain; unavailN++; }
       else { remainAvail+=c.remain; used+=c.used; size+=c.size; knownN++; }
@@ -798,7 +825,7 @@ function renderSummary(accounts){
   const pct=total>0?Math.round(used/total*100):0;
   let barColor="var(--ok)"; if(pct>60)barColor="var(--warn)"; if(pct>85)barColor="var(--err)";
   // 标题文案：「可用」过滤时直接用"可用账号"；其他用通用「全部账号」
-  const scopeLabel=currentFilter==="all"?"全部账号":(currentFilter==="available"?"可用账号":(currentFilter==="global"?"Global 账号":(currentFilter==="cn"?"CN 账号":(currentFilter==="exhausted"?"耗尽账号":(currentFilter==="preserve"?"保号账号":(currentFilter==="failed"?"失败账号":"全部账号"))))));
+  const scopeLabel=currentFilter==="all"?"全部账号":(currentFilter==="available"?"可用账号":(currentFilter==="global"?"Global 账号":(currentFilter==="cn"?"CN 账号":(currentFilter==="exhausted"?"耗尽账号":(currentFilter==="preserve"?"保号账号":(currentFilter==="failed"?"失败账号":(currentFilter==="test"?"测试账号":"全部账号")))))));
   const allTotal=allSize>0?allSize:(allRemain+allUsed);
   box.style.display="block";
   box.innerHTML=`
@@ -1044,6 +1071,25 @@ async function selectAuth(idx, btn){
     toast("选用失败","err",e.message||String(e));
   }finally{
     busy(btn,false);
+  }
+}
+async function testActive(idx, btn){
+  busy(btn, true);
+  try{
+    const d=await api("/test-active", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({auth_index: idx})
+    });
+    if(d.error){
+      toast("测试失败", "err", d.error);
+    } else {
+      toast("活跃测试成功", "ok", d.message || ("模型: " + (d.model || "-")));
+    }
+  }catch(e){
+    toast("测试失败", "err", e.message || String(e));
+  }finally{
+    busy(btn, false);
   }
 }
 async function refreshCredits(idx, btn){

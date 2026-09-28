@@ -22,10 +22,12 @@ type wbAccount struct {
 	Region       string          `json:"region"` // "cn" or "global"
 	Plan         string          `json:"plan"`
 	Status       string          `json:"status"`
+	CreatedAt    string          `json:"created_at,omitempty"` // account creation time (RFC3339), from JWT auth_time
 	Disabled     bool            `json:"disabled"`
 	Exhausted    bool            `json:"exhausted"`
-	Selected     bool            `json:"selected"` // panel active routing card
-	Preserve     bool            `json:"preserve"` // watchdog parked this account; never routed
+	Selected     bool            `json:"selected"`    // panel active routing card
+	Preserve     bool            `json:"preserve"`    // watchdog parked this account; never routed
+	TestFailed   bool            `json:"test_failed"` // scheduled active-ping failed while credits remained
 	Credits      *creditsSummary `json:"credits,omitempty"`
 	Checkin      *checkinSummary `json:"checkin,omitempty"`
 	TrialClaimed bool            `json:"trial_claimed,omitempty"` // Global: expert trial already claimed
@@ -86,6 +88,7 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 				Name:      f.Name,
 				Label:     f.Label,
 				Status:    f.Status,
+				CreatedAt: f.CreatedAt.Format(time.RFC3339),
 				Disabled:  f.Disabled,
 				Success:   f.Success,
 				Failed:    f.Failed,
@@ -96,25 +99,35 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 				out[i] = acct
 				return
 			}
+			// CreatedAt: prefer the JWT auth_time (the real account creation
+			// moment). The host's HostAuthFileEntry.CreatedAt is unusable for
+			// display — the file watcher re-stamps it with time.Now() on every
+			// rescan, so it drifts to the latest credit refresh / keepalive /
+			// test ping. Keep the host value only as a last-resort fallback for
+			// legacy files whose token carries no auth_time.
+			if t, ok := parseCreatedAtFromAccessToken(sa.Auth.AccessToken); ok {
+				acct.CreatedAt = t.Format(time.RFC3339)
+			}
 			// Physical file is source of truth for disabled (host list may lag).
 			if phys != nil {
 				acct.Disabled = phys.Disabled
+				acct.TestFailed = parseTestFailedFromAuthJSON(phys.JSON)
 				if phys.Name != "" {
 					acct.Name = phys.Name
 				}
 			}
-		acct.Nickname = sa.Account.Nickname
-		acct.UID = sa.Account.UID
-		// Success/Failed prefer the plugin-owned cumulative counters (survive
-		// restart). The host-list values set above are the recent-window
-		// (last ~200min) numbers — kept as the fallback for UID-less legacy
-		// accounts. UID-bearing accounts read the in-memory cumulative value
-		// (seeded from the persisted json at startup, then memory-first; see
-		// counter.go) without re-reading json on every render.
-		if strings.TrimSpace(acct.UID) != "" {
-			ensureCounterLoaded(acct.UID, phys.JSON)
-			acct.Success, acct.Failed = counterSnapshot(acct.UID)
-		}
+			acct.Nickname = sa.Account.Nickname
+			acct.UID = sa.Account.UID
+			// Success/Failed prefer the plugin-owned cumulative counters (survive
+			// restart). The host-list values set above are the recent-window
+			// (last ~200min) numbers — kept as the fallback for UID-less legacy
+			// accounts. UID-bearing accounts read the in-memory cumulative value
+			// (seeded from the persisted json at startup, then memory-first; see
+			// counter.go) without re-reading json on every render.
+			if strings.TrimSpace(acct.UID) != "" {
+				ensureCounterLoaded(acct.UID, phys.JSON)
+				acct.Success, acct.Failed = counterSnapshot(acct.UID)
+			}
 			acct.Region = accountRegion(sa)
 			if fetchCredits {
 				plan, ci, cr, errs := cachedAccountDetails(f.ID, sa, force)
